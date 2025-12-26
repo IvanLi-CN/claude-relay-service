@@ -1,0 +1,113 @@
+name: GHCR Test Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch, tag, or SHA). Leave empty to build the workflow ref.'
+        required: false
+        default: ''
+      platforms:
+        description: 'Target platforms (comma-separated)'
+        required: false
+        default: 'linux/amd64'
+      image:
+        description: 'Override image name (default: ghcr.io/<owner>/claude-relay-service)'
+        required: false
+        default: ''
+      push:
+        description: 'Push image to GHCR'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-test-build-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Compute image/tags
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ref_input="${{ inputs.ref }}"
+          if [[ -z "${ref_input}" ]]; then
+            ref_name="${GITHUB_REF_NAME}"
+          else
+            ref_name="${ref_input}"
+            ref_name="${ref_name#refs/heads/}"
+            ref_name="${ref_name#refs/tags/}"
+          fi
+
+          safe_ref="$(echo "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g' | sed -E 's#^-+|-+$##g')"
+          owner="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          default_image="ghcr.io/${owner}/claude-relay-service"
+
+          image_input="${{ inputs.image }}"
+          if [[ -z "${image_input}" ]]; then
+            image="${default_image}"
+          else
+            image="$(echo "${image_input}" | tr '[:upper:]' '[:lower:]')"
+          fi
+
+          full_sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+
+          {
+            echo "image=${image}"
+            echo "safe_ref=${safe_ref}"
+            echo "full_sha=${full_sha}"
+            echo "short_sha=${short_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (and optionally push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: |
+            ${{ steps.vars.outputs.image }}:test-${{ steps.vars.outputs.safe_ref }}
+            ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.full_sha }}
+
+      - name: Summary
+        run: |
+          echo "Image: ${{ steps.vars.outputs.image }}"
+          echo "Tags:"
+          echo "  - test-${{ steps.vars.outputs.safe_ref }}"
+          echo "  - sha-${{ steps.vars.outputs.short_sha }}"
+          echo ""
+          echo "Pull:"
+          echo "  docker pull ${{ steps.vars.outputs.image }}:test-${{ steps.vars.outputs.safe_ref }}"
+          echo "  docker pull ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}"
